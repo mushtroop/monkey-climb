@@ -34,11 +34,12 @@
 <div id="overlay">
   <div id="title">🦍 Monkey Climb — Stage 1</div>
   <div id="instructions">
-    Climbing + arm-swing locomotion test. In VR: <b>pump your arms like you're running</b>
-    to swing yourself around the map — gravity always pulls you down, so you'll settle
-    back to the ground between swings. You can also <b>squeeze the grip button</b> near
-    a tree trunk, wall, or bar to grab and hang on precisely. On desktop: WASD + mouse
-    to fly around and preview the map.
+    Real Gorilla Tag locomotion test. In VR: <b>squeeze the grip button</b> to grab any
+    surface — trees, walls, bars, or even the ground itself — then move your hand to pull
+    your whole body around. Let go to fling yourself with real momentum. There's no
+    swinging in open air — just like the real game, you always need to actually touch
+    something to move. Crouch down and grab the floor to push yourself along the ground.
+    On desktop: WASD + mouse to fly around and preview the map.
   </div>
 </div>
 <div id="vrBtnWrap"><button id="vrBtn" disabled>Checking WebXR support...</button></div>
@@ -287,27 +288,46 @@ function buildClimbingStructures() {
   }
 }
 
-// ---------- Grabbing / climbing physics ----------
+// ---------- Grabbing / climbing physics (ported from the real GorillaLocomotion algorithm) ----------
+function getHeadWorldPos() {
+  const p = new THREE.Vector3();
+  camera.getWorldPosition(p);
+  return p;
+}
+
+function clampToArmLength(rawPos, headPos) {
+  const offset = rawPos.clone().sub(headPos);
+  if (offset.length() > MAX_ARM_LENGTH) {
+    offset.setLength(MAX_ARM_LENGTH);
+    return headPos.clone().add(offset);
+  }
+  return rawPos;
+}
+
 function onGripStart(i) {
   const ctrl = i === 0 ? controller0 : controller1;
-  const worldPos = new THREE.Vector3();
-  ctrl.getWorldPosition(worldPos);
+  const rawPos = new THREE.Vector3();
+  ctrl.getWorldPosition(rawPos);
+  const worldPos = clampToArmLength(rawPos, getHeadWorldPos());
 
   // find nearest climbable within reach
   let nearest = null, nearestDist = Infinity;
   for (const c of climbables) {
     let d;
     if (c.isGround) {
-      // flat plane: only grabbable when the hand is actually near floor height
-      // and within the map bounds — not based on distance to a center point
+      // flat plane: only grabbable when the hand is near floor height and
+      // within the map bounds — not based on distance to a center point.
+      // Tolerance is generous since floor-height tracking in a browser is
+      // inherently approximate.
       const withinBounds = Math.abs(worldPos.x) < c.halfExtent && Math.abs(worldPos.z) < c.halfExtent;
       if (!withinBounds) continue;
       d = Math.abs(worldPos.y - c.groundY);
     } else {
       d = worldPos.distanceTo(c.center);
     }
+    const tolerance = c.isGround ? GROUND_GRAB_TOLERANCE : GRAB_RADIUS;
     const effectiveRadius = c.isGround ? 0 : c.radius;
-    if (d < effectiveRadius + GRAB_RADIUS && d < nearestDist) {
+    if (d < effectiveRadius + tolerance && d < nearestDist) {
       nearest = c;
       nearestDist = d;
     }
@@ -318,16 +338,29 @@ function onGripStart(i) {
   g.held = true;
   g.lastPos.copy(worldPos);
   g.curPos.copy(worldPos);
-  g.velocity.set(0, 0, 0);
-  state.bodyVelocity.set(0, 0, 0); // stop momentum the instant you grab something
+  // freeze momentum the instant you grab something, exactly like the real game
+  state.bodyVelocity.set(0, 0, 0);
 }
 
 function onGripEnd(i) {
   const g = state.grip[i];
   if (!g.held) return;
   g.held = false;
-  // fling body with the hand's last recorded velocity (opposite direction)
-  state.bodyVelocity.add(g.velocity.clone().multiplyScalar(-1));
+
+  const otherHeld = state.grip[1 - i].held;
+  if (otherHeld) return; // still holding on with the other hand — no throw yet
+
+  // Real Gorilla Tag throws you using a ROLLING AVERAGE of your recent body
+  // velocity, not just the last frame — this is what makes releases feel
+  // controlled instead of jittery. Below a small threshold, releasing gently
+  // doesn't launch you at all.
+  if (denormalizedVelocityAverage.length() > VELOCITY_LIMIT) {
+    const throwVel = denormalizedVelocityAverage.clone().multiplyScalar(JUMP_MULTIPLIER);
+    if (throwVel.length() > MAX_JUMP_SPEED) throwVel.setLength(MAX_JUMP_SPEED);
+    state.bodyVelocity.copy(throwVel);
+  } else {
+    state.bodyVelocity.set(0, 0, 0);
+  }
 }
 
 function updateClimbing(dt) {
@@ -339,70 +372,43 @@ function updateClimbing(dt) {
     anyHeld = true;
 
     const ctrl = i === 0 ? controller0 : controller1;
-    ctrl.getWorldPosition(g.curPos);
+    const rawPos = new THREE.Vector3();
+    ctrl.getWorldPosition(rawPos);
+    g.curPos.copy(clampToArmLength(rawPos, getHeadWorldPos()));
 
     const delta = g.curPos.clone().sub(g.lastPos);
     // move the whole rig opposite to hand travel -> hand appears to "stay put"
-    // relative to the world, exactly like grabbing a real branch
+    // relative to the world, exactly like grabbing a real branch or the floor
     dolly.position.sub(delta);
+    g.lastPos.copy(g.curPos);
 
-    if (dt > 0) g.velocity.copy(delta).divideScalar(dt);
-    g.lastPos.copy(g.curPos);
-    // re-sync curPos with dolly move so next frame's delta is correct
-    ctrl.getWorldPosition(g.curPos);
-    g.lastPos.copy(g.curPos);
+    // momentum stays frozen the whole time a hand is gripping
+    state.bodyVelocity.set(0, 0, 0);
   }
 
   if (!anyHeld) {
-    // Arm-swing locomotion: pumping your hands through the air propels you,
-    // same feel as Gorilla Tag's push-and-release technique but continuous,
-    // so you don't need to precisely grab a surface every time. Gravity is
-    // always active here too, so swinging never lets you fly upward.
-    for (let i = 0; i < 2; i++) {
-      const ctrl = i === 0 ? controller0 : controller1;
-      const worldPos = new THREE.Vector3();
-      ctrl.getWorldPosition(worldPos);
-      const track = handSwingTrack[i];
-
-      if (track.initialized && dt > 0) {
-        const delta = worldPos.clone().sub(track.prevPos);
-        const horizSpeed = Math.hypot(delta.x, delta.z) / dt;
-        if (horizSpeed > SWING_DEADZONE) {
-          // body moves opposite to the hand swing direction, same convention
-          // as grabbing — push your hand back, your body goes forward
-          state.bodyVelocity.x -= delta.x * SWING_FACTOR;
-          state.bodyVelocity.z -= delta.z * SWING_FACTOR;
-        }
-      }
-      track.prevPos.copy(worldPos);
-      track.initialized = true;
-    }
-
-    // clamp horizontal speed so swinging can't accelerate forever
-    const horizVel = new THREE.Vector3(state.bodyVelocity.x, 0, state.bodyVelocity.z);
-    if (horizVel.length() > MAX_SWING_SPEED) {
-      horizVel.setLength(MAX_SWING_SPEED);
-      state.bodyVelocity.x = horizVel.x;
-      state.bodyVelocity.z = horizVel.z;
-    }
-
+    // Free fall / thrown momentum. There's no free-space "swing to move" in
+    // the real game — gravity is simply always on, and the only way to move
+    // is by a hand actually touching a surface (including the ground itself).
     state.bodyVelocity.y -= GRAVITY * dt;
-    state.bodyVelocity.x *= AIR_FRICTION;
-    state.bodyVelocity.z *= AIR_FRICTION;
     dolly.position.addScaledVector(state.bodyVelocity, dt);
 
     if (dolly.position.y <= GROUND_Y) {
       dolly.position.y = GROUND_Y;
       state.bodyVelocity.y = 0;
-      state.bodyVelocity.x *= 0.9; // extra ground friction so you settle down between swings
+      state.bodyVelocity.x *= 0.9; // ground friction so you settle rather than skate forever
       state.bodyVelocity.z *= 0.9;
     }
-  } else {
-    // reset swing tracking so re-engaging swing after a grab doesn't cause a
-    // sudden jump from a stale previous hand position
-    handSwingTrack[0].initialized = false;
-    handSwingTrack[1].initialized = false;
   }
+
+  // Continuously track a rolling average of the BODY's own velocity — this is
+  // exactly what a hand-release throw draws from in the real game.
+  const currentBodyVel = dolly.position.clone().sub(lastDollyPosition).divideScalar(Math.max(dt, 0.0001));
+  const oldest = velocityHistory[velocityHistoryIndex];
+  denormalizedVelocityAverage.add(currentBodyVel.clone().sub(oldest).divideScalar(VELOCITY_HISTORY_SIZE));
+  velocityHistory[velocityHistoryIndex] = currentBodyVel;
+  velocityHistoryIndex = (velocityHistoryIndex + 1) % VELOCITY_HISTORY_SIZE;
+  lastDollyPosition.copy(dolly.position);
 }
 
 // ---------- VR session ----------
