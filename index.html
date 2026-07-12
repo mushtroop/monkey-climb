@@ -34,12 +34,12 @@
 <div id="overlay">
   <div id="title">🦍 Monkey Climb — Stage 1</div>
   <div id="instructions">
-    Real Gorilla Tag locomotion test. In VR: <b>squeeze the grip button</b> to grab any
-    surface — trees, walls, bars, or even the ground itself — then move your hand to pull
-    your whole body around. Let go to fling yourself with real momentum. There's no
-    swinging in open air — just like the real game, you always need to actually touch
-    something to move. Crouch down and grab the floor to push yourself along the ground.
-    On desktop: WASD + mouse to fly around and preview the map.
+    Real Gorilla Tag locomotion test. In VR: just <b>touch a surface with your hand</b> —
+    a tree, wall, bar, or the ground — no button needed. Move your hand while touching
+    to pull your whole body around, and let go to fling yourself with real momentum.
+    There's no swinging in open air; just like the real game, you always need to
+    actually make contact with something to move. Hands glow when they're touching
+    something. On desktop: WASD + mouse to fly around and preview the map.
   </div>
 </div>
 <div id="vrBtnWrap"><button id="vrBtn" disabled>Checking WebXR support...</button></div>
@@ -51,17 +51,17 @@
 (function() {
 
 let camera, scene, renderer, dolly, dummyCam;
+let handMeshes;
 let controller0, controller1, controllerGrip0, controllerGrip1;
 let climbables = []; // { mesh, center: THREE.Vector3(world), radius }
 const GRAB_RADIUS = 0.55;
 
 const state = {
-  grip: [
-    { held: false, lastPos: new THREE.Vector3(), curPos: new THREE.Vector3() },
-    { held: false, lastPos: new THREE.Vector3(), curPos: new THREE.Vector3() }
+  hands: [
+    { touching: false, attachedObj: null, lastPos: new THREE.Vector3() },
+    { touching: false, attachedObj: null, lastPos: new THREE.Vector3() }
   ],
-  bodyVelocity: new THREE.Vector3(),
-  onGround: false
+  bodyVelocity: new THREE.Vector3()
 };
 
 const GRAVITY = 9.8;
@@ -84,6 +84,8 @@ const MAX_ARM_LENGTH = 1.5;          // hands beyond this distance from head get
 const GROUND_GRAB_TOLERANCE = 1.0;   // meters of vertical slack for grabbing the floor —
                                       // generous because floor-height estimation in a
                                       // browser is inherently approximate
+const RELEASE_HYSTERESIS = 0.15;     // extra slack once already attached, so contact
+                                      // doesn't flicker on/off right at the boundary
 
 let velocityHistory = new Array(VELOCITY_HISTORY_SIZE).fill(null).map(() => new THREE.Vector3());
 let velocityHistoryIndex = 0;
@@ -142,18 +144,17 @@ function init() {
   dolly.add(controller0);
   dolly.add(controller1);
 
+  handMeshes = [null, null];
   [controller0, controller1].forEach((ctrl, i) => {
     const handMesh = new THREE.Mesh(
       new THREE.SphereGeometry(0.045, 12, 12),
       new THREE.MeshStandardMaterial({ color: i === 0 ? 0x64d98a : 0xffb347, emissive: 0x113311 })
     );
     ctrl.add(handMesh);
-
-    ctrl.addEventListener('squeezestart', () => onGripStart(i));
-    ctrl.addEventListener('squeezeend', () => onGripEnd(i));
-    // some Quest browsers fire 'select' for hand-tracking pinch too
-    ctrl.addEventListener('selectstart', () => onGripStart(i));
-    ctrl.addEventListener('selectend', () => onGripEnd(i));
+    handMeshes[i] = handMesh;
+    // No grab button — movement is purely physical hand-to-surface contact,
+    // exactly like the real game. Touch detection happens every frame in
+    // updatePhysics() below, not through controller button events.
   });
 
   setupVRButton();
@@ -304,27 +305,19 @@ function clampToArmLength(rawPos, headPos) {
   return rawPos;
 }
 
-function onGripStart(i) {
-  const ctrl = i === 0 ? controller0 : controller1;
-  const rawPos = new THREE.Vector3();
-  ctrl.getWorldPosition(rawPos);
-  const worldPos = clampToArmLength(rawPos, getHeadWorldPos());
+function distanceToClimbable(worldPos, c) {
+  if (c.isGround) {
+    const withinBounds = Math.abs(worldPos.x) < c.halfExtent && Math.abs(worldPos.z) < c.halfExtent;
+    if (!withinBounds) return Infinity;
+    return Math.abs(worldPos.y - c.groundY);
+  }
+  return worldPos.distanceTo(c.center);
+}
 
-  // find nearest climbable within reach
+function findNearestClimbable(worldPos) {
   let nearest = null, nearestDist = Infinity;
   for (const c of climbables) {
-    let d;
-    if (c.isGround) {
-      // flat plane: only grabbable when the hand is near floor height and
-      // within the map bounds — not based on distance to a center point.
-      // Tolerance is generous since floor-height tracking in a browser is
-      // inherently approximate.
-      const withinBounds = Math.abs(worldPos.x) < c.halfExtent && Math.abs(worldPos.z) < c.halfExtent;
-      if (!withinBounds) continue;
-      d = Math.abs(worldPos.y - c.groundY);
-    } else {
-      d = worldPos.distanceTo(c.center);
-    }
+    const d = distanceToClimbable(worldPos, c);
     const tolerance = c.isGround ? GROUND_GRAB_TOLERANCE : GRAB_RADIUS;
     const effectiveRadius = c.isGround ? 0 : c.radius;
     if (d < effectiveRadius + tolerance && d < nearestDist) {
@@ -332,28 +325,14 @@ function onGripStart(i) {
       nearestDist = d;
     }
   }
-  if (!nearest) return;
-
-  const g = state.grip[i];
-  g.held = true;
-  g.lastPos.copy(worldPos);
-  g.curPos.copy(worldPos);
-  // freeze momentum the instant you grab something, exactly like the real game
-  state.bodyVelocity.set(0, 0, 0);
+  return nearest;
 }
 
-function onGripEnd(i) {
-  const g = state.grip[i];
-  if (!g.held) return;
-  g.held = false;
-
-  const otherHeld = state.grip[1 - i].held;
-  if (otherHeld) return; // still holding on with the other hand — no throw yet
-
+function releaseThrow() {
   // Real Gorilla Tag throws you using a ROLLING AVERAGE of your recent body
   // velocity, not just the last frame — this is what makes releases feel
-  // controlled instead of jittery. Below a small threshold, releasing gently
-  // doesn't launch you at all.
+  // controlled instead of jittery. Below a small threshold, letting go
+  // gently doesn't launch you at all.
   if (denormalizedVelocityAverage.length() > VELOCITY_LIMIT) {
     const throwVel = denormalizedVelocityAverage.clone().multiplyScalar(JUMP_MULTIPLIER);
     if (throwVel.length() > MAX_JUMP_SPEED) throwVel.setLength(MAX_JUMP_SPEED);
@@ -363,30 +342,53 @@ function onGripEnd(i) {
   }
 }
 
-function updateClimbing(dt) {
-  let anyHeld = false;
+function updatePhysics(dt) {
+  let anyTouching = false;
 
   for (let i = 0; i < 2; i++) {
-    const g = state.grip[i];
-    if (!g.held) continue;
-    anyHeld = true;
-
+    const g = state.hands[i];
     const ctrl = i === 0 ? controller0 : controller1;
     const rawPos = new THREE.Vector3();
     ctrl.getWorldPosition(rawPos);
-    g.curPos.copy(clampToArmLength(rawPos, getHeadWorldPos()));
+    const worldPos = clampToArmLength(rawPos, getHeadWorldPos());
 
-    const delta = g.curPos.clone().sub(g.lastPos);
-    // move the whole rig opposite to hand travel -> hand appears to "stay put"
-    // relative to the world, exactly like grabbing a real branch or the floor
-    dolly.position.sub(delta);
-    g.lastPos.copy(g.curPos);
+    if (g.touching) {
+      // already attached — check whether we've moved far enough away to let go
+      const c = g.attachedObj;
+      const d = distanceToClimbable(worldPos, c);
+      const tolerance = (c.isGround ? GROUND_GRAB_TOLERANCE : GRAB_RADIUS) + RELEASE_HYSTERESIS;
+      const effectiveRadius = c.isGround ? 0 : c.radius;
 
-    // momentum stays frozen the whole time a hand is gripping
-    state.bodyVelocity.set(0, 0, 0);
+      if (d < effectiveRadius + tolerance) {
+        const delta = worldPos.clone().sub(g.lastPos);
+        // move the whole rig opposite to hand travel -> hand appears to "stay
+        // put" relative to the world, exactly like touching a real branch
+        dolly.position.sub(delta);
+        g.lastPos.copy(worldPos);
+        state.bodyVelocity.set(0, 0, 0); // momentum frozen while touching
+        anyTouching = true;
+      } else {
+        g.touching = false;
+        g.attachedObj = null;
+        if (handMeshes[i]) handMeshes[i].material.emissive.setHex(0x113311);
+        if (!state.hands[1 - i].touching) releaseThrow();
+      }
+    } else {
+      // not attached — check if the hand just made contact with something.
+      // No button involved at all: pure physical proximity, like the real game.
+      const nearest = findNearestClimbable(worldPos);
+      if (nearest) {
+        g.touching = true;
+        g.attachedObj = nearest;
+        g.lastPos.copy(worldPos);
+        state.bodyVelocity.set(0, 0, 0);
+        anyTouching = true;
+        if (handMeshes[i]) handMeshes[i].material.emissive.setHex(0x66ff88);
+      }
+    }
   }
 
-  if (!anyHeld) {
+  if (!anyTouching) {
     // Free fall / thrown momentum. There's no free-space "swing to move" in
     // the real game — gravity is simply always on, and the only way to move
     // is by a hand actually touching a surface (including the ground itself).
@@ -540,7 +542,7 @@ function render() {
   const dt = Math.min(clock.getDelta(), 0.05);
 
   if (renderer.xr.isPresenting) {
-    updateClimbing(dt);
+    updatePhysics(dt);
   } else {
     updateDesktopFly(dt);
   }
