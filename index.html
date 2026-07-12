@@ -56,8 +56,8 @@ const GRAB_RADIUS = 0.55;
 
 const state = {
   grip: [
-    { held: false, lastPos: new THREE.Vector3(), curPos: new THREE.Vector3(), velocity: new THREE.Vector3() },
-    { held: false, lastPos: new THREE.Vector3(), curPos: new THREE.Vector3(), velocity: new THREE.Vector3() }
+    { held: false, lastPos: new THREE.Vector3(), curPos: new THREE.Vector3() },
+    { held: false, lastPos: new THREE.Vector3(), curPos: new THREE.Vector3() }
   ],
   bodyVelocity: new THREE.Vector3(),
   onGround: false
@@ -67,15 +67,27 @@ const GRAVITY = 9.8;
 const GROUND_Y = 0;
 const clock = new THREE.Clock();
 
-// ---------- Arm-swing locomotion (free movement, no grab required) ----------
-const handSwingTrack = [
-  { prevPos: new THREE.Vector3(), initialized: false },
-  { prevPos: new THREE.Vector3(), initialized: false }
-];
-const SWING_FACTOR = 1.4;       // how strongly hand swing speed becomes body speed
-const MAX_SWING_SPEED = 6;      // m/s cap on swing-driven horizontal speed
-const AIR_FRICTION = 0.98;      // per-frame horizontal damping while free-moving
-const SWING_DEADZONE = 0.35;    // m/s — ignore tiny hand jitter below this
+// ---------- Real Gorilla Tag movement constants ----------
+// Ported from Another Axiom's official open-sourced Player.cs (MIT licensed):
+// https://github.com/Another-Axiom/GorillaLocomotion
+// Core idea: there is NO free-space "swing to move" in the real game — every
+// bit of locomotion comes from a hand actually touching a surface. On release,
+// your throw velocity comes from a ROLLING AVERAGE of your recent body
+// velocity (not just the last frame), which is what makes throws feel
+// controlled instead of jittery.
+const VELOCITY_HISTORY_SIZE = 8;     // frames averaged for release-throw velocity
+const JUMP_MULTIPLIER = 1.3;         // scales the averaged velocity into a throw
+const MAX_JUMP_SPEED = 11;           // hard cap on throw speed (m/s)
+const VELOCITY_LIMIT = 0.25;         // below this, releasing doesn't throw you at all
+const MAX_ARM_LENGTH = 1.5;          // hands beyond this distance from head get clamped in
+const GROUND_GRAB_TOLERANCE = 1.0;   // meters of vertical slack for grabbing the floor —
+                                      // generous because floor-height estimation in a
+                                      // browser is inherently approximate
+
+let velocityHistory = new Array(VELOCITY_HISTORY_SIZE).fill(null).map(() => new THREE.Vector3());
+let velocityHistoryIndex = 0;
+let denormalizedVelocityAverage = new THREE.Vector3();
+let lastDollyPosition = new THREE.Vector3();
 
 // ---------- Desktop fallback controls ----------
 const keys = {};
