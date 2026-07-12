@@ -85,9 +85,6 @@ const GROUND_GRAB_TOLERANCE = 1.0;   // meters of vertical slack for grabbing th
                                       // browser is inherently approximate
 const RELEASE_HYSTERESIS = 0.15;     // extra slack once already attached, so contact
                                       // doesn't flicker on/off right at the boundary
-const GROUND_RELATIVE_DROP = 0.75;   // meters your hand must be below YOUR OWN head to
-                                      // count as touching the ground — self-calibrating,
-                                      // so it works even if floor-height tracking is off
 
 let velocityHistory = new Array(VELOCITY_HISTORY_SIZE).fill(null).map(() => new THREE.Vector3());
 let velocityHistoryIndex = 0;
@@ -311,11 +308,6 @@ function distanceToClimbable(worldPos, c, headPos) {
   if (c.isGround) {
     const withinBounds = Math.abs(worldPos.x) < c.halfExtent && Math.abs(worldPos.z) < c.halfExtent;
     if (!withinBounds) return Infinity;
-    // Self-calibrating fallback: if your hand is well below your OWN head,
-    // treat it as ground contact regardless of absolute floor-height
-    // calibration error — this is what makes crouching down actually work
-    // even when the browser's floor tracking is imperfect.
-    if (headPos && (headPos.y - worldPos.y) > GROUND_RELATIVE_DROP) return 0;
     return Math.abs(worldPos.y - c.groundY);
   }
   return worldPos.distanceTo(c.center);
