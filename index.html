@@ -34,12 +34,11 @@
 <div id="overlay">
   <div id="title">🦍 Monkey Climb — Stage 1</div>
   <div id="instructions">
-    Real Gorilla Tag locomotion test. In VR: just <b>touch a surface with your hand</b> —
-    a tree, wall, bar, or the ground — no button needed. Move your hand while touching
-    to pull your whole body around, and let go to fling yourself with real momentum.
-    There's no swinging in open air; just like the real game, you always need to
-    actually make contact with something to move. Hands glow when they're touching
-    something. On desktop: WASD + mouse to fly around and preview the map.
+    Real Gorilla Tag locomotion test. In VR: just <b>swing your hand onto any surface</b> —
+    a tree, wall, or bar — no button, no need to crouch. Even a quick swing will register
+    now, not just a slow deliberate hold. Move your hand while touching to pull your whole
+    body around, and let go to fling yourself with real momentum. Hands glow when they're
+    touching something. On desktop: WASD + mouse to fly around and preview the map.
   </div>
 </div>
 <div id="vrBtnWrap"><button id="vrBtn" disabled>Checking WebXR support...</button></div>
@@ -58,8 +57,8 @@ const GRAB_RADIUS = 0.55;
 
 const state = {
   hands: [
-    { touching: false, attachedObj: null, lastPos: new THREE.Vector3() },
-    { touching: false, attachedObj: null, lastPos: new THREE.Vector3() }
+    { touching: false, attachedObj: null, lastPos: new THREE.Vector3(), prevPos: null },
+    { touching: false, attachedObj: null, lastPos: new THREE.Vector3(), prevPos: null }
   ],
   bodyVelocity: new THREE.Vector3()
 };
@@ -86,6 +85,9 @@ const GROUND_GRAB_TOLERANCE = 1.0;   // meters of vertical slack for grabbing th
                                       // browser is inherently approximate
 const RELEASE_HYSTERESIS = 0.15;     // extra slack once already attached, so contact
                                       // doesn't flicker on/off right at the boundary
+const GROUND_RELATIVE_DROP = 0.75;   // meters your hand must be below YOUR OWN head to
+                                      // count as touching the ground — self-calibrating,
+                                      // so it works even if floor-height tracking is off
 
 let velocityHistory = new Array(VELOCITY_HISTORY_SIZE).fill(null).map(() => new THREE.Vector3());
 let velocityHistoryIndex = 0;
@@ -305,19 +307,53 @@ function clampToArmLength(rawPos, headPos) {
   return rawPos;
 }
 
-function distanceToClimbable(worldPos, c) {
+function distanceToClimbable(worldPos, c, headPos) {
   if (c.isGround) {
     const withinBounds = Math.abs(worldPos.x) < c.halfExtent && Math.abs(worldPos.z) < c.halfExtent;
     if (!withinBounds) return Infinity;
+    // Self-calibrating fallback: if your hand is well below your OWN head,
+    // treat it as ground contact regardless of absolute floor-height
+    // calibration error — this is what makes crouching down actually work
+    // even when the browser's floor tracking is imperfect.
+    if (headPos && (headPos.y - worldPos.y) > GROUND_RELATIVE_DROP) return 0;
     return Math.abs(worldPos.y - c.groundY);
   }
   return worldPos.distanceTo(c.center);
 }
 
-function findNearestClimbable(worldPos) {
+// Closest point on segment [a, b] to point p — used so a fast hand swing
+// can't skip past a thin contact zone within a single frame.
+function closestPointOnSegment(p, a, b) {
+  const ab = b.clone().sub(a);
+  const abLenSq = ab.lengthSq();
+  if (abLenSq < 1e-8) return a.clone();
+  let t = p.clone().sub(a).dot(ab) / abLenSq;
+  t = Math.max(0, Math.min(1, t));
+  return a.clone().add(ab.multiplyScalar(t));
+}
+
+function distanceToClimbableSwept(prevPos, currPos, c, headPos) {
+  if (c.isGround) {
+    const dPrev = distanceToClimbable(prevPos, c, headPos);
+    const dCurr = distanceToClimbable(currPos, c, headPos);
+    let d = Math.min(dPrev, dCurr);
+    // catch the case where the hand crossed through floor height entirely
+    // between last frame and this one (fast downward swing)
+    if ((prevPos.y - c.groundY) * (currPos.y - c.groundY) < 0) {
+      const t = (c.groundY - prevPos.y) / (currPos.y - prevPos.y);
+      const cross = prevPos.clone().lerp(currPos, t);
+      if (Math.abs(cross.x) < c.halfExtent && Math.abs(cross.z) < c.halfExtent) d = 0;
+    }
+    return d;
+  }
+  const closest = closestPointOnSegment(c.center, prevPos, currPos);
+  return closest.distanceTo(c.center);
+}
+
+function findNearestClimbableSwept(prevPos, currPos, headPos) {
   let nearest = null, nearestDist = Infinity;
   for (const c of climbables) {
-    const d = distanceToClimbable(worldPos, c);
+    const d = distanceToClimbableSwept(prevPos, currPos, c, headPos);
     const tolerance = c.isGround ? GROUND_GRAB_TOLERANCE : GRAB_RADIUS;
     const effectiveRadius = c.isGround ? 0 : c.radius;
     if (d < effectiveRadius + tolerance && d < nearestDist) {
@@ -344,18 +380,19 @@ function releaseThrow() {
 
 function updatePhysics(dt) {
   let anyTouching = false;
+  const headPos = getHeadWorldPos();
 
   for (let i = 0; i < 2; i++) {
     const g = state.hands[i];
     const ctrl = i === 0 ? controller0 : controller1;
     const rawPos = new THREE.Vector3();
     ctrl.getWorldPosition(rawPos);
-    const worldPos = clampToArmLength(rawPos, getHeadWorldPos());
+    const worldPos = clampToArmLength(rawPos, headPos);
 
     if (g.touching) {
       // already attached — check whether we've moved far enough away to let go
       const c = g.attachedObj;
-      const d = distanceToClimbable(worldPos, c);
+      const d = distanceToClimbable(worldPos, c, headPos);
       const tolerance = (c.isGround ? GROUND_GRAB_TOLERANCE : GRAB_RADIUS) + RELEASE_HYSTERESIS;
       const effectiveRadius = c.isGround ? 0 : c.radius;
 
@@ -374,9 +411,14 @@ function updatePhysics(dt) {
         if (!state.hands[1 - i].touching) releaseThrow();
       }
     } else {
-      // not attached — check if the hand just made contact with something.
-      // No button involved at all: pure physical proximity, like the real game.
-      const nearest = findNearestClimbable(worldPos);
+      // Not attached — check if the hand made contact with something.
+      // No button involved at all: pure physical proximity, like the real
+      // game. Uses a SWEPT check against last frame's position too, so a
+      // fast swing can't skip past a thin contact zone in a single frame —
+      // this is what let you "bounce" off something with a quick swing
+      // instead of only registering a slow, deliberate hold.
+      const prevTrackedPos = g.prevPos || worldPos;
+      const nearest = findNearestClimbableSwept(prevTrackedPos, worldPos, headPos);
       if (nearest) {
         g.touching = true;
         g.attachedObj = nearest;
@@ -386,6 +428,8 @@ function updatePhysics(dt) {
         if (handMeshes[i]) handMeshes[i].material.emissive.setHex(0x66ff88);
       }
     }
+
+    g.prevPos = worldPos.clone();
   }
 
   if (!anyTouching) {
