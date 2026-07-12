@@ -80,9 +80,12 @@ const JUMP_MULTIPLIER = 1.3;         // scales the averaged velocity into a thro
 const MAX_JUMP_SPEED = 11;           // hard cap on throw speed (m/s)
 const VELOCITY_LIMIT = 0.25;         // below this, releasing doesn't throw you at all
 const MAX_ARM_LENGTH = 1.5;          // hands beyond this distance from head get clamped in
-const GROUND_GRAB_TOLERANCE = 1.0;   // meters of vertical slack for grabbing the floor —
-                                      // generous because floor-height estimation in a
-                                      // browser is inherently approximate
+const GROUND_GRAB_TOLERANCE = 0.25;  // meters of vertical slack for grabbing the floor.
+                                      // Kept tight on purpose: a generous tolerance here
+                                      // caused a runaway bug where completely normal hand
+                                      // movement kept re-triggering ground contact and
+                                      // ratcheted the player down into the floor over time
+                                      // with nothing to correct it back up.
 const RELEASE_HYSTERESIS = 0.15;     // extra slack once already attached, so contact
                                       // doesn't flicker on/off right at the boundary
 
@@ -437,6 +440,13 @@ function updatePhysics(dt) {
       state.bodyVelocity.x *= 0.9; // ground friction so you settle rather than skate forever
       state.bodyVelocity.z *= 0.9;
     }
+  }
+
+  // Hard safety-net floor clamp — applied unconditionally, even while
+  // actively touching something. No matter what the contact/drag logic
+  // above does in any edge case, you can never end up sunk below the floor.
+  if (dolly.position.y < GROUND_Y) {
+    dolly.position.y = GROUND_Y;
   }
 
   // Continuously track a rolling average of the BODY's own velocity — this is
