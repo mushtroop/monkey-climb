@@ -34,9 +34,7 @@
 <div id="overlay">
   <div id="title">🦍 Monkey Climb — Stage 1</div>
   <div id="instructions">
-    Real Gorilla Tag locomotion test. Your height is scaled down to gorilla proportions,
-    just like the real game — stand normally and your hands should already reach the
-    ground and nearby surfaces. In VR: just <b>swing your hand onto any surface</b> —
+    Real Gorilla Tag locomotion test. In VR: just <b>swing your hand onto any surface</b> —
     a tree, wall, or bar — no button, no need to crouch. Even a quick swing will register,
     not just a slow deliberate hold. Move your hand while touching to pull your whole body
     around, and let go to fling yourself with real momentum. Hands glow when they're
@@ -51,17 +49,22 @@
 <script>
 (function() {
 
-let camera, scene, renderer, dolly, dummyCam, trackingRoot;
+let camera, scene, renderer, dolly, dummyCam;
 let handMeshes;
 let controller0, controller1, controllerGrip0, controllerGrip1;
 let climbables = []; // { mesh, center: THREE.Vector3(world), radius }
-const GRAB_RADIUS = 0.55;
-const PLAYER_SCALE = 0.6; // shrinks real-world tracked motion to gorilla-like
-                          // proportions — a standing human ends up with a
-                          // shorter effective height and shorter effective
-                          // reach, so hands naturally land near the ground
-                          // without crouching. Tune this if reach feels off:
-                          // lower = shorter/closer to ground, higher = taller.
+const GRAB_RADIUS = 0.55; // hand hitbox size for touching climbable objects —
+                          // real Gorilla Tag doesn't shrink the player, it
+                          // just tunes this hitbox: forgiving enough to
+                          // actually register a touch, tight enough that you
+                          // don't get swallowed into the geometry you touch.
+const BODY_HEAD_RADIUS = 0.12; // separate from the hand hitbox entirely: this
+                          // is the real game's headCollider concept — your
+                          // HAND can reach right down to the floor, but your
+                          // HEAD/BODY has its own minimum clearance so the
+                          // camera itself can never be dragged or clipped
+                          // into the ground, no matter what the hand-drag
+                          // math does.
 
 const state = {
   hands: [
@@ -117,19 +120,14 @@ function init() {
 
   camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.05, 500);
 
-  // Dolly = the "body" we move around. Camera + controllers live inside a
-  // SCALED tracking root, not directly on the dolly — this is the actual
-  // trick real Gorilla Tag uses: your real-world tracked motion is shrunk
-  // down to gorilla proportions, so a normal standing human ends up with a
-  // shorter effective height and arms that naturally reach the ground
-  // without crouching. Without this, we were doing a straight 1:1 human
-  // height mapping, which is why crouching felt mandatory.
+  // Dolly = the "body" we move around. Camera + controllers are children so
+  // moving the dolly moves the whole tracked volume, exactly how locomotion
+  // works in a real VR rig. Real height, no scaling — the real game doesn't
+  // shrink the player either; it's the hand hitbox size that matters, tuned
+  // below in GRAB_RADIUS / GROUND_GRAB_TOLERANCE.
   dolly = new THREE.Group();
   dolly.position.set(0, 0, 8);
-  trackingRoot = new THREE.Group();
-  trackingRoot.scale.setScalar(PLAYER_SCALE);
-  dolly.add(trackingRoot);
-  trackingRoot.add(camera);
+  dolly.add(camera);
   scene.add(dolly);
 
   renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -158,8 +156,8 @@ function init() {
   // ---------- WebXR controllers ----------
   controller0 = renderer.xr.getController(0);
   controller1 = renderer.xr.getController(1);
-  trackingRoot.add(controller0);
-  trackingRoot.add(controller1);
+  dolly.add(controller0);
+  dolly.add(controller1);
 
   handMeshes = [null, null];
   [controller0, controller1].forEach((ctrl, i) => {
@@ -457,11 +455,26 @@ function updatePhysics(dt) {
     }
   }
 
-  // Hard safety-net floor clamp — applied unconditionally, even while
-  // actively touching something. No matter what the contact/drag logic
-  // above does in any edge case, you can never end up sunk below the floor.
+  // Hard safety-net floor clamp on the BODY ROOT — applied unconditionally,
+  // even while actively touching something.
   if (dolly.position.y < GROUND_Y) {
     dolly.position.y = GROUND_Y;
+  }
+
+  // HEAD/BODY collision clearance — this is the piece that was actually
+  // missing. The body-root clamp above only stops the abstract dolly
+  // position from going below the floor; it does NOT stop the real camera
+  // itself from clipping into the ground, since the camera's real height
+  // above the dolly comes from your actual tracked head pose and can end up
+  // very low (tracking drift, being dragged there, crouching hard, etc).
+  // The real game solves this with a dedicated head collider completely
+  // independent of the hand hitbox — so we do the same: if the camera would
+  // end up closer to the floor than a small head-sized clearance, push the
+  // whole rig up bodily so the camera can never actually clip into the ground.
+  const cameraWorldY = dolly.position.y + camera.position.y;
+  const minCameraY = GROUND_Y + BODY_HEAD_RADIUS;
+  if (cameraWorldY < minCameraY) {
+    dolly.position.y += (minCameraY - cameraWorldY);
   }
 
   // Continuously track a rolling average of the BODY's own velocity — this is
