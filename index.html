@@ -34,10 +34,12 @@
 <div id="overlay">
   <div id="title">🦍 Monkey Climb — Stage 1</div>
   <div id="instructions">
-    Real Gorilla Tag locomotion test. In VR: just <b>swing your hand onto any surface</b> —
-    a tree, wall, or bar — no button, no need to crouch. Even a quick swing will register
-    now, not just a slow deliberate hold. Move your hand while touching to pull your whole
-    body around, and let go to fling yourself with real momentum. Hands glow when they're
+    Real Gorilla Tag locomotion test. Your height is scaled down to gorilla proportions,
+    just like the real game — stand normally and your hands should already reach the
+    ground and nearby surfaces. In VR: just <b>swing your hand onto any surface</b> —
+    a tree, wall, or bar — no button, no need to crouch. Even a quick swing will register,
+    not just a slow deliberate hold. Move your hand while touching to pull your whole body
+    around, and let go to fling yourself with real momentum. Hands glow when they're
     touching something. On desktop: WASD + mouse to fly around and preview the map.
   </div>
 </div>
@@ -49,11 +51,17 @@
 <script>
 (function() {
 
-let camera, scene, renderer, dolly, dummyCam;
+let camera, scene, renderer, dolly, dummyCam, trackingRoot;
 let handMeshes;
 let controller0, controller1, controllerGrip0, controllerGrip1;
 let climbables = []; // { mesh, center: THREE.Vector3(world), radius }
 const GRAB_RADIUS = 0.55;
+const PLAYER_SCALE = 0.6; // shrinks real-world tracked motion to gorilla-like
+                          // proportions — a standing human ends up with a
+                          // shorter effective height and shorter effective
+                          // reach, so hands naturally land near the ground
+                          // without crouching. Tune this if reach feels off:
+                          // lower = shorter/closer to ground, higher = taller.
 
 const state = {
   hands: [
@@ -109,12 +117,19 @@ function init() {
 
   camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.05, 500);
 
-  // Dolly = the "body" we move around. Camera + controllers are children so
-  // moving the dolly moves the whole tracked volume, exactly how locomotion
-  // works in a real VR rig.
+  // Dolly = the "body" we move around. Camera + controllers live inside a
+  // SCALED tracking root, not directly on the dolly — this is the actual
+  // trick real Gorilla Tag uses: your real-world tracked motion is shrunk
+  // down to gorilla proportions, so a normal standing human ends up with a
+  // shorter effective height and arms that naturally reach the ground
+  // without crouching. Without this, we were doing a straight 1:1 human
+  // height mapping, which is why crouching felt mandatory.
   dolly = new THREE.Group();
   dolly.position.set(0, 0, 8);
-  dolly.add(camera);
+  trackingRoot = new THREE.Group();
+  trackingRoot.scale.setScalar(PLAYER_SCALE);
+  dolly.add(trackingRoot);
+  trackingRoot.add(camera);
   scene.add(dolly);
 
   renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -143,8 +158,8 @@ function init() {
   // ---------- WebXR controllers ----------
   controller0 = renderer.xr.getController(0);
   controller1 = renderer.xr.getController(1);
-  dolly.add(controller0);
-  dolly.add(controller1);
+  trackingRoot.add(controller0);
+  trackingRoot.add(controller1);
 
   handMeshes = [null, null];
   [controller0, controller1].forEach((ctrl, i) => {
